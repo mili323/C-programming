@@ -10,415 +10,563 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 
-//  DATA STRUCTURES 
+#define MAX_INPUT_SIZE 10000
+#define MAX_FILENAME 256
+#define MAX_OUTPUT_PATH 512
+#define MAX_FOLDER_NAME 512
+
+// Token types for lexical analysis
 typedef enum {
-    TOK_NUMBER,    // Numeric literal (integer or float)
-    TOK_PLUS,      // Addition operator '+'
-    TOK_MINUS,     // Subtraction operator '-'
-    TOK_STAR,      // Multiplication operator '*'
-    TOK_SLASH,     // Division operator '/'
-    TOK_POW,       // Exponentiation operator ''  
-    TOK_LPAREN,    // Left parenthesis '('          
-    TOK_RPAREN,    // Right parenthesis ')'
-    TOK_EOF,       // End of input
-    TOK_ERROR      // Invalid token
-} TokenType;
+    TK_INTEGER,
+    TK_FLOAT,
+    TK_ADD,
+    TK_SUBTRACT,
+    TK_MULTIPLY,
+    TK_DIVIDE,
+    TK_POWER,
+    TK_LEFT_PAREN,
+    TK_RIGHT_PAREN,
+    TK_END,
+    TK_BAD
+} TokenKind;
 
+// Token structure stores type, value, and position for error reporting
 typedef struct {
-    TokenType type;
-    double value;
-    int start_pos;
+    TokenKind kind;
+    double numeric_value;
+    int char_index;     // 1-based position for error messages
+    int token_length;
 } Token;
 
+// Scanner state for tokenizing input
 typedef struct {
-    const char *input;
-    int length;
-    int position;
-    Token current_token;
+    const char* source_text;
+    int text_length;
+    int current_index;
+    Token lookahead;
     int has_error;
     int error_position;
-} Parser;
+} Scanner;
 
-// Global variables
-char *input_dir = NULL;
-char *output_dir = NULL;
-char *single_file = NULL;
+// Parser state with error tracking
+typedef struct {
+    Scanner* scanner;
+    int failed;
+    int fail_position;
+    const char* fail_reason;
+} ExpressionParser;
 
-// FUNCTION DECLARATIONS 
-// ADDED THESE DECLARATIONS TO FIX IMPLICIT DECLARATION ERRORS
-double parse_expression(Parser *parser);
-double parse_term(Parser *parser);
-double parse_power(Parser *parser);
-double parse_primary(Parser *parser);
-void next_token(Parser *parser);
+// Configuration for command line options
+typedef struct {
+    char input_path[MAX_FILENAME];
+    char output_path[MAX_FILENAME];
+    int directory_mode;
+} ProgramOptions;
 
-//  UTILITY FUNCTIONS 
-int is_whitespace(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+// Initialize scanner with input text
+static void setup_scanner(Scanner* scan, const char* text, int len) {
+    scan->source_text = text;
+    scan->text_length = len;
+    scan->current_index = 0;
+    scan->has_error = 0;
+    scan->error_position = 0;
+    scan->lookahead.kind = TK_BAD;
+    scan->lookahead.char_index = 1;
 }
 
-void fail(Parser *parser, int pos) {
-    if (!parser->has_error) {
-        parser->has_error = 1;
-        parser->error_position = pos;
+// Skip whitespace to find next token
+static void skip_spaces(Scanner* scan) {
+    while (scan->current_index < scan->text_length && 
+           isspace(scan->source_text[scan->current_index])) {
+        scan->current_index++;
     }
 }
 
-void create_directory_if_missing(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        mkdir(path, 0775);
-    }
-}
-
-//  TOKENIZER 
-int should_skip_line(const char *input, int *pos, int length) {
-    // REMOVED unused variable 'original_pos'
-    int temp_pos = *pos;
+// Convert input characters to tokens with position tracking
+static Token fetch_next_token(Scanner* scan) {
+    skip_spaces(scan);
     
-    // Skip whitespace
-    while (temp_pos < length && is_whitespace(input[temp_pos])) {
-        temp_pos++;
+    // Return END token when input is exhausted
+    if (scan->current_index >= scan->text_length) {
+        return (Token){TK_END, 0.0, scan->current_index + 1, 0};
     }
     
-    // Skip comment lines
-    if (temp_pos < length && input[temp_pos] == '#') {
-        while (temp_pos < length && input[temp_pos] != '\n') temp_pos++;
-        if (temp_pos < length && input[temp_pos] == '\n') temp_pos++;
-        *pos = temp_pos;
+    int start_index = scan->current_index;
+    int char_position = start_index + 1; // Convert to 1-based indexing
+    char current_char = scan->source_text[start_index];
+    
+    // Handle single-character operators and parentheses
+    switch (current_char) {
+        case '+': scan->current_index++; return (Token){TK_ADD, 0.0, char_position, 1};
+        case '-': scan->current_index++; return (Token){TK_SUBTRACT, 0.0, char_position, 1};
+        case '*': 
+            // Check for ** operator (exponentiation)
+            if (scan->current_index + 1 < scan->text_length && 
+                scan->source_text[scan->current_index + 1] == '*') {
+                scan->current_index += 2;
+                return (Token){TK_POWER, 0.0, char_position, 2};
+            }
+            scan->current_index++;
+            return (Token){TK_MULTIPLY, 0.0, char_position, 1};
+        case '/': scan->current_index++; return (Token){TK_DIVIDE, 0.0, char_position, 1};
+        case '(': scan->current_index++; return (Token){TK_LEFT_PAREN, 0.0, char_position, 1};
+        case ')': scan->current_index++; return (Token){TK_RIGHT_PAREN, 0.0, char_position, 1};
+    }
+    
+    // Parse numeric literals using strtod for proper float handling
+    if (isdigit(current_char) || current_char == '.') {
+        char* parse_end;
+        double num_value = strtod(scan->source_text + start_index, &parse_end);
+        int token_len = parse_end - (scan->source_text + start_index);
+        
+        if (token_len > 0) {
+            scan->current_index += token_len;
+            // Determine if it's integer or float by checking for decimal/scientific notation
+            TokenKind num_kind = TK_INTEGER;
+            for (const char* p = scan->source_text + start_index; p < parse_end; p++) {
+                if (*p == '.' || *p == 'e' || *p == 'E') {
+                    num_kind = TK_FLOAT;
+                    break;
+                }
+            }
+            return (Token){num_kind, num_value, char_position, token_len};
+        }
+    }
+    
+    // Invalid character encountered
+    scan->current_index++;
+    scan->has_error = 1;
+    scan->error_position = char_position;
+    return (Token){TK_BAD, 0.0, char_position, 1};
+}
+
+static Token scanner_current(Scanner* scan) {
+    return scan->lookahead;
+}
+
+static void scanner_advance(Scanner* scan) {
+    scan->lookahead = fetch_next_token(scan);
+}
+
+static void initialize_scanner(Scanner* scan, const char* text, int len) {
+    setup_scanner(scan, text, len);
+    scanner_advance(scan);
+}
+
+// Record first parsing error with position and reason
+static void parser_fail(ExpressionParser* parser, int where, const char* reason) {
+    if (!parser->failed) {
+        parser->failed = 1;
+        parser->fail_position = where;
+        parser->fail_reason = reason;
+    }
+}
+
+static int parser_check(ExpressionParser* parser, TokenKind expected) {
+    return scanner_current(parser->scanner).kind == expected;
+}
+
+static int parser_accept(ExpressionParser* parser, TokenKind expected) {
+    if (parser_check(parser, expected)) {
+        scanner_advance(parser->scanner);
         return 1;
     }
-    
     return 0;
 }
 
-void next_token(Parser *parser) {
-    // Skip whitespace and comments
-    while (parser->position < parser->length) {
-        if (should_skip_line(parser->input, &parser->position, parser->length)) continue;
-        if (is_whitespace(parser->input[parser->position])) {
-            parser->position++;
-        } else break;
+// Forward declarations for recursive descent parser
+static double parse_primary_expression(ExpressionParser* parser);
+static double parse_exponent_expression(ExpressionParser* parser);
+static double parse_multiplicative_expression(ExpressionParser* parser);
+static double parse_additive_expression(ExpressionParser* parser);
+
+// primary := NUMBER | '(' expr ')'
+// Handles atomic expressions - numbers and parenthesized subexpressions
+static double parse_primary_expression(ExpressionParser* parser) {
+    Token current = scanner_current(parser->scanner);
+    
+    if (parser_accept(parser, TK_INTEGER) || parser_accept(parser, TK_FLOAT)) {
+        return current.numeric_value;
     }
     
-    // End of input
-    if (parser->position >= parser->length) {
-        parser->current_token.type = TOK_EOF;
-        parser->current_token.start_pos = parser->position + 1;
-        return;
-    }
-    
-    char c = parser->input[parser->position];
-    int start_pos = parser->position + 1;
-    
-    // Parse numbers
-    if (isdigit(c) || c == '.' || 
-        ((c == '+' || c == '-') && parser->position + 1 < parser->length && 
-         (isdigit(parser->input[parser->position + 1]) || parser->input[parser->position + 1] == '.'))) {
+    if (parser_accept(parser, TK_LEFT_PAREN)) {
+        double inner_result = parse_additive_expression(parser);
+        if (parser->failed) return 0.0;
         
-        char *end_ptr;
-        double value = strtod(parser->input + parser->position, &end_ptr);
-        
-        if (end_ptr > parser->input + parser->position) {
-            parser->current_token.type = TOK_NUMBER;
-            parser->current_token.value = value;
-            parser->current_token.start_pos = start_pos;
-            parser->position = end_ptr - parser->input;
-            return;
+        // Require matching closing parenthesis
+        if (!parser_accept(parser, TK_RIGHT_PAREN)) {
+            parser_fail(parser, scanner_current(parser->scanner).char_index, "Missing closing parenthesis");
+            return 0.0;
         }
+        return inner_result;
     }
     
-    // Parse operators
-    parser->current_token.start_pos = start_pos;
-    switch (c) {
-        case '+': parser->current_token.type = TOK_PLUS; parser->position++; break;
-        case '-': parser->current_token.type = TOK_MINUS; parser->position++; break;
-        case '*': 
-            if (parser->position + 1 < parser->length && parser->input[parser->position + 1] == '*') {
-                parser->current_token.type = TOK_POW; parser->position += 2;  // FIXED: POW not POM
-            } else {
-                parser->current_token.type = TOK_STAR; parser->position++;
-            }
-            break;
-        case '/': parser->current_token.type = TOK_SLASH; parser->position++; break;
-        case '(': parser->current_token.type = TOK_LPAREN; parser->position++; break;  // FIXED: LPAREN not IPAREN
-        case ')': parser->current_token.type = TOK_RPAREN; parser->position++; break;
-        default: parser->current_token.type = TOK_ERROR; fail(parser, start_pos); break;
-    }
+    parser_fail(parser, current.char_index, "Expected number or opening parenthesis");
+    return 0.0;
 }
 
-void init_parser(Parser *parser, const char *input, int length) {
-    parser->input = input;
-    parser->length = length;
-    parser->position = 0;
-    parser->has_error = 0;
-    parser->error_position = -1;
-    next_token(parser);
-}
-
-//  PARSER (Recursive Descent) 
-
-// Parse numbers and parentheses
-double parse_primary(Parser *parser) {
-    if (parser->has_error) return 0;
+// power := primary { '' primary }  (right-associative)
+// Exponentiation has highest precedence and is right-associative per Python rules
+static double parse_exponent_expression(ExpressionParser* parser) {
+    double base = parse_primary_expression(parser);
+    if (parser->failed) return 0.0;
     
-    Token token = parser->current_token;
-    
-    if (token.type == TOK_NUMBER) {
-        next_token(parser);
-        return token.value;
-    }
-    else if (token.type == TOK_LPAREN) {  // FIXED: LPAREN not IPAREN
-        next_token(parser);
-        double result = parse_expression(parser);
-        if (parser->has_error) return 0;
+    while (parser_accept(parser, TK_POWER)) {
+        int op_position = scanner_current(parser->scanner).char_index;
+        // Right-associative: recursively parse exponent for 2*32 = 2(3*2)
+        double exponent = parse_exponent_expression(parser);
         
-        if (parser->current_token.type != TOK_RPAREN) {
-            fail(parser, parser->current_token.start_pos);
-            return 0;
+        if (parser->failed) return 0.0;
+        
+        // Check for mathematical errors in exponentiation
+        if (base == 0.0 && exponent < 0) {
+            parser_fail(parser, op_position, "Zero raised to negative power");
+            return 0.0;
         }
-        next_token(parser);
-        return result;
-    }
-    else {
-        fail(parser, token.start_pos);
-        return 0;
-    }
-}
-
-// Parse power operator (right-associative)
-double parse_power(Parser *parser) {
-    if (parser->has_error) return 0;
-    
-    double left = parse_primary(parser);
-    
-    while (!parser->has_error && parser->current_token.type == TOK_POW) {  // FIXED: POW not POM
-        int op_pos = parser->current_token.start_pos;
-        next_token(parser);
-        double right = parse_power(parser); // Right-associative
         
-        if (parser->has_error) return 0;
-        
-        // Error checking
-        if (left == 0 && right < 0) {
-            fail(parser, op_pos);
-            return 0;
+        double result = pow(base, exponent);
+        if (isinf(result) || isnan(result)) {
+            parser_fail(parser, op_position, "Math error in exponentiation");
+            return 0.0;
         }
-        left = pow(left, right);
+        base = result;
     }
-    return left;
+    
+    return base;
 }
 
-// Parse multiplication and division
-double parse_term(Parser *parser) {
-    if (parser->has_error) return 0;
+// term := power { ('*' | '/') power }
+// Handle multiplication and division with left associativity
+static double parse_multiplicative_expression(ExpressionParser* parser) {
+    double result = parse_exponent_expression(parser);
+    if (parser->failed) return 0.0;
     
-    double result = parse_power(parser);
-    
-    while (!parser->has_error && (parser->current_token.type == TOK_STAR || 
-                                 parser->current_token.type == TOK_SLASH)) {
-        Token op = parser->current_token;
-        next_token(parser);
-        double right = parse_power(parser);
+    while (1) {
+        Token op = scanner_current(parser->scanner);
         
-        if (parser->has_error) return 0;
-        
-        if (op.type == TOK_STAR) {
+        if (parser_accept(parser, TK_MULTIPLY)) {
+            double right = parse_exponent_expression(parser);
+            if (parser->failed) return 0.0;
             result *= right;
-        } else {
-            if (right == 0.0) {
-                fail(parser, op.start_pos);
-                return 0;
+        }
+        else if (parser_accept(parser, TK_DIVIDE)) {
+            double right = parse_exponent_expression(parser);
+            if (parser->failed) return 0.0;
+            
+            // Check for division by zero with tolerance for floating point
+            if (fabs(right) < 1e-15) {
+                parser_fail(parser, op.char_index, "Division by zero");
+                return 0.0;
             }
             result /= right;
         }
+        else {
+            break;
+        }
     }
+    
     return result;
 }
 
-// Parse addition and subtraction
-double parse_expression(Parser *parser) {
-    if (parser->has_error) return 0;
+// expr := term { ('+' | '-') term }
+// Top-level expression parser handling addition and subtraction
+static double parse_additive_expression(ExpressionParser* parser) {
+    double result = parse_multiplicative_expression(parser);
+    if (parser->failed) return 0.0;
     
-    double result = parse_term(parser);
-    
-    while (!parser->has_error && (parser->current_token.type == TOK_PLUS || 
-                                 parser->current_token.type == TOK_MINUS)) {
-        Token op = parser->current_token;
-        next_token(parser);
-        double right = parse_term(parser);
-        
-        if (parser->has_error) return 0;
-        
-        if (op.type == TOK_PLUS) {
+    while (1) {
+        if (parser_accept(parser, TK_ADD)) {
+            double right = parse_multiplicative_expression(parser);
+            if (parser->failed) return 0.0;
             result += right;
-        } else {
+        }
+        else if (parser_accept(parser, TK_SUBTRACT)) {
+            double right = parse_multiplicative_expression(parser);
+            if (parser->failed) return 0.0;
             result -= right;
         }
+        else {
+            break;
+        }
     }
+    
     return result;
 }
 
-// Main evaluation
-double evaluate_expression(Parser *parser) {
-    double result = parse_expression(parser);
+// Main evaluation function that coordinates scanning and parsing
+static double evaluate_expression_string(const char* expression, int length, int* error_location) {
+    Scanner scan;
+    ExpressionParser parser;
     
-    // Check for extra tokens
-    if (!parser->has_error && parser->current_token.type != TOK_EOF) {
-        fail(parser, parser->current_token.start_pos);
-        return 0;
+    initialize_scanner(&scan, expression, length);
+    parser.scanner = &scan;
+    parser.failed = 0;
+    parser.fail_position = 0;
+    parser.fail_reason = NULL;
+    
+    double computation_result = parse_additive_expression(&parser);
+    
+    // Check for extra tokens after valid expression
+    if (!parser.failed && !parser_accept(&parser, TK_END)) {
+        parser_fail(&parser, scanner_current(&scan).char_index, "Extra characters after expression");
     }
-    return result;
+    
+    // Handle lexer-level errors
+    if (scan.has_error && !parser.failed) {
+        parser_fail(&parser, scan.error_position, "Invalid character in input");
+    }
+    
+    if (parser.failed) {
+        *error_location = parser.fail_position;
+        return 0.0;
+    }
+    
+    *error_location = 0;
+    return computation_result;
 }
 
-//  FILE OPERATIONS 
+// Check if line starts with '#' after optional whitespace (Python-style comments)
+static int is_comment(const char* line) {
+    while (*line && isspace(*line)) line++;
+    return *line == '#';
+}
 
-char* build_output_path(const char *input_path) {
-    static char output_path[1024];
-    const char *filename = strrchr(input_path, '/');
-    filename = filename ? filename + 1 : input_path;
+// Portable string duplication
+static char* duplicate_string(const char* original) {
+    if (!original) return NULL;
+    size_t len = strlen(original) + 1;
+    char* copy = malloc(len);
+    if (copy) memcpy(copy, original, len);
+    return copy;
+}
+
+// Process single input file and create corresponding output file
+static void handle_single_file(const char* input_file, const char* output_folder, 
+                              const char* first_name, const char* family_name, const char* id) {
+    FILE* input = fopen(input_file, "r");
+    if (!input) {
+        fprintf(stderr, "Failed to open: %s\n", input_file);
+        return;
+    }
     
-    char base_name[256];
-    strncpy(base_name, filename, sizeof(base_name) - 1);
-    base_name[sizeof(base_name) - 1] = '\0';
+    char* file_content = NULL;
+    size_t total_size = 0;
+    size_t allocated = 0;
+    char read_buffer[1024];
     
-    // Remove .txt extension
-    char *dot = strrchr(base_name, '.');
+    // Read file while skipping comment lines
+    while (fgets(read_buffer, sizeof(read_buffer), input)) {
+        if (is_comment(read_buffer)) continue;
+        
+        size_t chunk_size = strlen(read_buffer);
+        if (total_size + chunk_size + 1 > allocated) {
+            allocated = allocated ? allocated * 2 : 2048;
+            char* new_memory = realloc(file_content, allocated);
+            if (!new_memory) {
+                fprintf(stderr, "Memory allocation failed\n");
+                free(file_content);
+                fclose(input);
+                return;
+            }
+            file_content = new_memory;
+        }
+        memcpy(file_content + total_size, read_buffer, chunk_size);
+        total_size += chunk_size;
+    }
+    fclose(input);
+    
+    if (!file_content) {
+        file_content = duplicate_string("");
+        total_size = 0;
+    } else {
+        file_content[total_size] = '\0';
+    }
+    
+    int problem_position;
+    double answer = evaluate_expression_string(file_content, total_size, &problem_position);
+    
+    // Generate output filename with student information
+    char output_file_path[MAX_OUTPUT_PATH];
+    const char* base_name = strrchr(input_file, '/');
+    base_name = base_name ? base_name + 1 : input_file;
+    
+    char name_without_extension[MAX_FILENAME];
+    strncpy(name_without_extension, base_name, sizeof(name_without_extension) - 1);
+    name_without_extension[sizeof(name_without_extension) - 1] = '\0';
+    char* dot_location = strrchr(name_without_extension, '.');
+    if (dot_location && strcmp(dot_location, ".txt") == 0) *dot_location = '\0';
+    
+    int path_len = snprintf(output_file_path, sizeof(output_file_path), "%s/%s_%s_%s_%s.txt",
+             output_folder, name_without_extension, first_name, family_name, id);
+    
+    if (path_len >= (int)sizeof(output_file_path)) {
+        fprintf(stderr, "Output path too long: %s\n", output_file_path);
+        free(file_content);
+        return;
+    }
+    
+    // Create output directory if it doesn't exist
+    struct stat dir_check;
+    if (stat(output_folder, &dir_check) == -1) {
+        mkdir(output_folder, 0775);
+    }
+    
+    FILE* output = fopen(output_file_path, "w");
+    if (!output) {
+        fprintf(stderr, "Cannot create output: %s\n", output_file_path);
+        free(file_content);
+        return;
+    }
+    
+    // Write result or error with position
+    if (problem_position != 0) {
+        fprintf(output, "ERROR:%d\n", problem_position);
+    } else {
+        // Print integers without decimals, floats with full precision
+        if (fabs(answer - round(answer)) < 1e-12) {
+            fprintf(output, "%.0f\n", answer);
+        } else {
+            fprintf(output, "%.15g\n", answer);
+        }
+    }
+    
+    fclose(output);
+    free(file_content);
+}
+
+// Process all .txt files in a directory
+static void process_directory_files(const char* input_folder, const char* output_folder,
+                                   const char* first_name, const char* family_name, const char* id) {
+    DIR* folder = opendir(input_folder);
+    if (!folder) {
+        fprintf(stderr, "Cannot open directory: %s\n", input_folder);
+        return;
+    }
+    
+    struct dirent* entry;
+    while ((entry = readdir(folder))) {
+        const char* filename = entry->d_name;
+        size_t name_length = strlen(filename);
+        
+        // Process only .txt files (case sensitive)
+        if (name_length > 4 && strcmp(filename + name_length - 4, ".txt") == 0) {
+            char full_path[MAX_FILENAME];
+            snprintf(full_path, sizeof(full_path), "%s/%s", input_folder, filename);
+            
+            struct stat file_info;
+            if (stat(full_path, &file_info) == 0 && S_ISREG(file_info.st_mode)) {
+                printf("Processing: %s\n", filename);
+                handle_single_file(full_path, output_folder, first_name, family_name, id);
+            }
+        }
+    }
+    closedir(folder);
+}
+
+// Generate default output directory name per assignment requirements
+static void generate_output_folder_name(const char* input_file, const char* user, const char* id, char* buffer, size_t buffer_size) {
+    const char* base = strrchr(input_file, '/');
+    base = base ? base + 1 : input_file;
+    
+    char no_extension[MAX_FILENAME];
+    strncpy(no_extension, base, sizeof(no_extension) - 1);
+    no_extension[sizeof(no_extension) - 1] = '\0';
+    
+    char* dot = strrchr(no_extension, '.');
     if (dot) *dot = '\0';
     
-    if (output_dir) {
-        snprintf(output_path, sizeof(output_path), "%s/%s_nandana_subhash_241ADB029.txt", 
-                 output_dir, base_name);
-    } else {
-        char default_dir[512];
-        snprintf(default_dir, sizeof(default_dir), "%s_nandana_subhash_241ADB029", base_name);
-        create_directory_if_missing(default_dir);
-        snprintf(output_path, sizeof(output_path), "%s/%s_nandana_subhash_241ADB029.txt", 
-                 default_dir, base_name);
-    }
-    return output_path;
+    snprintf(buffer, buffer_size, "%s_%s_%s", no_extension, user, id);
 }
 
-void process_single_file(const char *input_path) {
-    FILE *file = fopen(input_path, "r");
-    if (!file) {
-        perror("Error opening file");
-        exit(1);
-    }
+// Parse command line arguments with support for options
+static int parse_command_line(int arg_count, char* arg_values[], ProgramOptions* options) {
+    options->input_path[0] = '\0';
+    options->output_path[0] = '\0';
+    options->directory_mode = 0;
     
-    // Read file
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    
-    char *input = malloc(size + 1);
-    if (!input) {
-        perror("Memory allocation failed");
-        fclose(file);
-        exit(1);
-    }
-    
-    //  Check fread return value
-    size_t bytes_read = fread(input, 1, size, file);
-    if (bytes_read != (size_t)size) {
-        perror("Error reading file");
-        free(input);
-        fclose(file);
-        exit(1);
-    }
-    input[bytes_read] = '\0';
-    fclose(file);
-    
-    // Parse and evaluate
-    Parser parser;
-    init_parser(&parser, input, bytes_read);
-    double result = evaluate_expression(&parser);
-    
-    // Write result
-    char *output_path = build_output_path(input_path);
-    FILE *output = fopen(output_path, "w");
-    if (!output) {
-        perror("Error opening output file");
-        free(input);
-        exit(1);
-    }
-    
-    if (parser.has_error) {
-        fprintf(output, "ERROR:%d\n", parser.error_position);
-    } else {
-        // Print integers without decimals
-        if (fabs(result - round(result)) < 1e-12) {
-            fprintf(output, "%.0f\n", result);
-        } else {
-            fprintf(output, "%.15g\n", result);
+    for (int i = 1; i < arg_count; i++) {
+        if (strcmp(arg_values[i], "-d") == 0 || strcmp(arg_values[i], "--dir") == 0) {
+            if (i + 1 >= arg_count) {
+                fprintf(stderr, "Option %s requires directory path\n", arg_values[i]);
+                return 0;
+            }
+            strncpy(options->input_path, arg_values[++i], MAX_FILENAME - 1);
+            options->input_path[MAX_FILENAME - 1] = '\0';
+            options->directory_mode = 1;
         }
-    }
-    fclose(output);
-    free(input);
-}
-
-void process_directory(const char *dir_path) {
-    DIR *dir = opendir(dir_path);
-    if (!dir) {
-        perror("Error opening directory");
-        exit(1);
-    }
-    
-    if (output_dir) create_directory_if_missing(output_dir);
-    
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        const char *name = entry->d_name;
-        if (strlen(name) > 4 && strcmp(name + strlen(name) - 4, ".txt") == 0) {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/%s", dir_path, name);
-            printf("Processing: %s\n", name);
-            process_single_file(path);
+        else if (strcmp(arg_values[i], "-o") == 0 || strcmp(arg_values[i], "--output-dir") == 0) {
+            if (i + 1 >= arg_count) {
+                fprintf(stderr, "Option %s requires directory path\n", arg_values[i]);
+                return 0;
+            }
+            strncpy(options->output_path, arg_values[++i], MAX_FILENAME - 1);
+            options->output_path[MAX_FILENAME - 1] = '\0';
         }
-    }
-    closedir(dir);
-}
-
-void parse_args(int argc, char *argv[]) {
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) && i + 1 < argc) {
-            input_dir = argv[++i];
-        }
-        else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0) && i + 1 < argc) {
-            output_dir = argv[++i];
-        }
-        else if (argv[i][0] == '-') {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            exit(1);
+        else if (arg_values[i][0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", arg_values[i]);
+            return 0;
         }
         else {
-            single_file = argv[i];
+            strncpy(options->input_path, arg_values[i], MAX_FILENAME - 1);
+            options->input_path[MAX_FILENAME - 1] = '\0';
         }
     }
     
-    if (input_dir && single_file) {
-        fprintf(stderr, "Cannot use both directory and single file\n");
-        exit(1);
+    if (options->input_path[0] == '\0') {
+        fprintf(stderr, "No input specified\n");
+        fprintf(stderr, "Usage: %s [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] input.txt\n", arg_values[0]);
+        return 0;
     }
+    
+    return 1;
 }
 
-//  MAIN FUNCTION 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [-d DIR] [-o OUTDIR] [input.txt]\n", argv[0]);
+int main(int arg_count, char* arg_values[]) {
+    ProgramOptions config;
+    
+    if (!parse_command_line(arg_count, arg_values, &config)) {
         return 1;
     }
     
-    parse_args(argc, argv);
+    // Student information for output file naming
+    const char* first_name = "Nandana";
+    const char* family_name = "Subhash";
+    const char* student_id = "241ADB029";
+    const char* username = "nandana";
     
-    if (output_dir) create_directory_if_missing(output_dir);
+    const char* output_directory;
+    char auto_directory[MAX_FOLDER_NAME];
     
-    if (input_dir) {
-        process_directory(input_dir);
+    // Determine output directory: custom or auto-generated
+    if (config.output_path[0] != '\0') {
+        output_directory = config.output_path;
     } else {
-        process_single_file(single_file);
+        if (config.directory_mode) {
+            snprintf(auto_directory, sizeof(auto_directory), "%s_%s_%s", 
+                    config.input_path, username, student_id);
+        } else {
+            generate_output_folder_name(config.input_path, username, student_id, auto_directory, sizeof(auto_directory));
+        }
+        output_directory = auto_directory;
     }
     
+    printf("Output will be saved to: %s\n", output_directory);
+    
+    // Create output directory if it doesn't exist
+    struct stat dir_info;
+    if (stat(output_directory, &dir_info) == -1) {
+        mkdir(output_directory, 0775);
+    }
+    
+    // Process single file or directory based on mode
+    if (config.directory_mode) {
+        process_directory_files(config.input_path, output_directory, first_name, family_name, student_id);
+    } else {
+        handle_single_file(config.input_path, output_directory, first_name, family_name, student_id);
+    }
+    
+    printf("Completed processing. Output location: %s\n", output_directory);
     return 0;
 }
